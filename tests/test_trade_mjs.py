@@ -50,9 +50,38 @@ class TradeMjs(unittest.TestCase):
     def test_live_actions_refused_without_switches(self):
         env = {k: v for k, v in os.environ.items() if k not in ("DRY_RUN", "LIVE_TRADING", "CONFIRM_LIVE")}
         for req in ({"action": "close", "positionId": "999999", "slippagePct": 2.5, "perp": PERP},
-                    {"action": "open", "isLong": True, "margin": 25, "leverage": 2, "slippagePct": 1.5, "perp": PERP}):
+                    {"action": "open", "isLong": True, "margin": 25, "leverage": 2, "slippagePct": 1.5, "perp": PERP},
+                    {"action": "reduce", "positionId": "187", "side": "long", "size": "1", "slippagePct": 1.5, "perp": PERP}):
             r = subprocess.run(["node", SCRIPT], input=json.dumps(req), capture_output=True, text=True, env=env, timeout=60)
             self.assertNotEqual(r.returncode, 0); self.assertIn("实盘开关", r.stderr)
+
+    def test_reduce_static_fail_closed(self):
+        good = {"action": "reduce", "positionId": "187", "side": "long", "size": "1.234567", "slippagePct": 1.5, "perp": PERP}
+        self.assertEqual(run(good).returncode, 0)
+        self.assertEqual(run(dict(good, size=None, full=True)).returncode, 0)
+        bad = [
+            dict(good, side="short"),
+            dict(good, isLong=False),
+            dict(good, size="0"),
+            dict(good, size="-1"),
+            dict(good, size="NaN"),
+            dict(good, size="Infinity"),
+            dict(good, size="1e-3"),
+            dict(good, size="1.2345678"),
+            dict(good, size=""),
+            dict(good, slippagePct=0),
+            dict(good, slippagePct=-1),
+            dict(good, perpDelta="1"),
+            dict(good, marginDelta="0"),
+            dict(good, full="true"),
+            dict(good, positionId=""),
+            dict(good, perp="0xnot-an-address"),
+            {"action": "reduce", "positionId": "187", "side": "long", "slippagePct": 1.5, "perp": PERP},
+        ]
+        for req in bad:
+            r = run(req)
+            self.assertNotEqual(r.returncode, 0, req)
+            self.assertNotIn("实盘开关", r.stderr)
 
 
 if __name__ == "__main__":

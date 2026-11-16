@@ -12,12 +12,21 @@
 //   {action:"open", perp, margin, leverage, isLong:false, allowShort:true, side:"short", ...}   开空：必须显式放行
 //   {action:"close", perp, positionId, slippagePct, maxImpactPct?, side?}   （与旧接口兼容：不给 maxImpactPct 时行为不变；
 //        给 side 时先核对链上方向一致）
-// 方向约定（SDK 0.19 / llms-full.txt「Close a position」「Open Positions」）：
+//   {action:"reduce", perp, positionId, side:"long", size?, slippagePct, maxImpactPct?, full?}
+//        只减已有多头。size 为正的 perp 数量（最多 6 位小数；字符串按十进制精确换成 1e6）。
+//        新鲜链上 entryPerpDelta 必须 >0，且 0 < 减仓 ≤ 剩余：不反手、不加仓。
+//        marginDelta 固定 0，绝不单独提保证金。小于剩余 → adjustTaker(perpDelta=-size)；
+//        等于剩余或 full:true → closePosition（SDK 内部同样 marginDelta=0 且 perpDelta=-全部），平光才退回保证金。
+//        不传 maxImpactPct 则不做应用层冲击上限（与 close 相同）。quote* 是报价，不是钱包 USDC。
+// 方向约定（SDK 0.19 / docs「Close a position」「Open Positions」）：
 //   开多 perpDelta>0 买入 base，amt1Limit = 最多付多少 USDC；开空 perpDelta<0 卖出 base，amt1Limit = 最少收多少 USDC
-//   平多卖出（amt1Limit=最少收），平空买回（amt1Limit=最多付，不能传 0）。都用 calculateTakerSlippageLimit(quote, swap 是否买入, %)
+//   平多/减多是卖出（amt1Limit=最少收），平空买回（amt1Limit=最多付，不能传 0）。
+//   都用 calculateTakerSlippageLimit(quote, swap 是否买入, %)；界限取费前 usdDelta，不取 effectiveUsdDelta。
+import { pathToFileURL } from 'node:url';
+import path from 'node:path';
 import {
   PerpCityContext, estimateTakerPosition, calculateTakerSlippageLimit,
-  openTakerPosition, estimateTakerAdjust, closePosition, fetchPoolTickMap,
+  openTakerPosition, estimateTakerAdjust, adjustTaker, closePosition, fetchPoolTickMap,
 } from '@strobelabs/perpcity-sdk';
 import { PERP_ABI } from '@strobelabs/perpcity-sdk/abis';
 import { fundingPaymentUsd, takerUtilOwed } from '@strobelabs/perpcity-sdk/math';
@@ -142,6 +151,151 @@ export function checkOpenRequest(req) {
   if (!(Number(req.slippagePct) > 0)) throw new Error('slippagePct 须 >0');
 }
 
+const MICRO = 1000000n;
+
+// 正的 perp 数量 → 链上 1e6 整数。字符串走十进制，避免 1.234567*1e6 的二进制误差。
+export function parseReduceMicro(size) {
+  if (typeof size === 'string') {
+    const m = /^(0|[1-9]\d*)(?:\.(\d{1,6}))?$/.exec(size.trim());
+    if (!m) throw new Error('reduce size 须为正的有限小数（最多 6 位），拒绝');
+    const micro = BigInt(m[1]) * MICRO + BigInt((m[2] ?? '').padEnd(6, '0'));
+    if (micro <= 0n) throw new Error('reduce size 须为正');
+    return micro;
+  }
+  if (typeof size === 'number') {
+    if (!Number.isFinite(size)) throw new Error('reduce size 非有限数，拒绝');
+    if (size <= 0) throw new Error('reduce size 须为正');
+    const scaled = size * 1e6;
+    const rounded = Math.round(scaled);
+    if (!Number.isSafeInteger(rounded) || rounded <= 0) throw new Error('reduce size 无法精确换算');
+    if (Math.abs(scaled - rounded) > 1e-6) throw new Error('reduce size 不能精确到 6 位小数，拒绝');
+    return BigInt(rounded);
+  }
+  throw new Error('reduce size 类型无效，拒绝');
+}
+
+export function parsePositionId(v) {
+  if (typeof v === 'bigint') {
+    if (v < 0n) throw new Error('positionId 无效');
+    return v;
+  }
+  if (typeof v === 'number') {
+    if (!Number.isSafeInteger(v) || v < 0) throw new Error('positionId 无效');
+    return BigInt(v);
+  }
+  if (typeof v === 'string' && /^(0|[1-9]\d*)$/.test(v)) return BigInt(v);
+  throw new Error('positionId 无效');
+}
+
+// 不连链的减仓检查。--validate-only 与实盘共用。
+export function checkReduceRequest(req) {
+  if (req.side !== 'long') throw new Error('reduce 只接受 side:"long"，拒绝');
+  if (req.isLong === false) throw new Error('reduce 不能开空或反手，拒绝');
+  if (req.perpDelta != null || req.marginDelta != null) throw new Error('reduce 不接受调用方 perpDelta/marginDelta，拒绝');
+  if (typeof req.slippagePct !== 'number' || !(req.slippagePct > 0) || !Number.isFinite(req.slippagePct))
+    throw new Error('slippagePct 须为 >0 的有限数');
+  if (req.slippagePct >= 100) throw new Error('减多滑点须 <100');
+  if (req.full != null && req.full !== true) throw new Error('full 只能为 true');
+  if (req.maxImpactPct != null && (typeof req.maxImpactPct !== 'number' || !Number.isFinite(req.maxImpactPct) || req.maxImpactPct < 0))
+    throw new Error('maxImpactPct 须为 ≥0 的有限数');
+  parsePositionId(req.positionId);
+  if (req.full === true) {
+    if (req.size != null) parseReduceMicro(req.size);
+  } else if (req.size == null) {
+    throw new Error('reduce 需要 size 或 full:true');
+  } else {
+    parseReduceMicro(req.size);
+  }
+}
+
+// 给定新鲜多头大小和已报价的卖出，算出 adjust/close 参数。不发交易。
+export function planLongReduce({ entryPerpDelta, reduceMicro, quote, slippagePct, maxImpactPct, spotPrice }) {
+  if (typeof entryPerpDelta !== 'bigint') throw new Error('链上仓位大小无效');
+  if (entryPerpDelta === 0n) throw new Error('仓位为空');
+  if (entryPerpDelta < 0n) throw new Error('仓位是空头，拒绝减仓（只减多，不反手、不加仓）');
+  if (typeof reduceMicro !== 'bigint' || reduceMicro <= 0n) throw new Error('reduce size 须为正');
+  if (reduceMicro > entryPerpDelta) throw new Error(`减仓 ${reduceMicro} 超过剩余 ${entryPerpDelta}，拒绝`);
+  const perpDelta = -reduceMicro;
+  if (perpDelta >= 0n || entryPerpDelta + perpDelta < 0n) throw new Error('减仓方向会加仓或反手，拒绝');
+  if (typeof quote?.usdDelta !== 'bigint' || typeof quote?.effectiveUsdDelta !== 'bigint') throw new Error('报价无效');
+  if (quote.usdDelta <= 0n) throw new Error('减多报价不是卖出所得，拒绝');
+  let impactPct = null;
+  if (maxImpactPct != null) {
+    if (!(spotPrice > 0) || !Number.isFinite(spotPrice) || !Number.isFinite(quote.fillPrice)) throw new Error('无法计算价格冲击');
+    impactPct = Math.abs(quote.fillPrice / spotPrice - 1) * 100;
+    if (impactPct > Number(maxImpactPct)) throw new Error(`减仓价格冲击 ${impactPct.toFixed(2)}% 超过上限 ${maxImpactPct}%，放弃`);
+  }
+  // 减多是卖出：第二个参数 false → 最少收 |usdDelta|×(1−滑点)，整数 bps，费前 usdDelta。
+  const amt1Limit = calculateTakerSlippageLimit(quote, perpDelta > 0n, slippagePct);
+  if (typeof amt1Limit !== 'bigint' || amt1Limit <= 0n) throw new Error('amt1Limit 必须 >0（减多是最少收）');
+  return {
+    full: reduceMicro === entryPerpDelta,
+    marginDelta: 0n,
+    perpDelta,
+    amt1Limit,
+    impactPct,
+    expectedRemainingPerp: entryPerpDelta - reduceMicro,
+  };
+}
+
+// sdk 由调用方注入（实盘传官方 SDK，单测传 mock）。不读环境、不签名。
+export async function executeLongReduce(req, sdk) {
+  checkReduceRequest(req);
+  const id = parsePositionId(req.positionId);
+  const perp = req.perp;
+  const raw = await sdk.getPositionRawData(perp, id);
+  if (raw?.perpId != null && String(raw.perpId).toLowerCase() !== String(perp).toLowerCase())
+    throw new Error('仓位市场与 perp 不一致，拒绝');
+  if (raw?.positionId != null && BigInt(raw.positionId) !== id) throw new Error('仓位 id 不一致，拒绝');
+  if (raw?.makerDetails) throw new Error('maker 仓位不能用 taker 减仓，拒绝');
+  const entry = raw?.entryPerpDelta;
+  if (typeof entry !== 'bigint') throw new Error('链上仓位大小无效');
+  if (entry === 0n) throw new Error('仓位为空');
+  if (entry < 0n) throw new Error('仓位是空头，拒绝减仓（只减多，不反手、不加仓）');
+  let reduceMicro;
+  if (req.full === true) {
+    if (req.size != null && parseReduceMicro(req.size) !== entry) throw new Error('full 与 size 不一致，拒绝');
+    reduceMicro = entry;
+  } else {
+    reduceMicro = parseReduceMicro(req.size);
+    if (reduceMicro > entry) throw new Error(`减仓 ${reduceMicro} 超过剩余 ${entry}，拒绝`);
+  }
+  const quoteDelta = -reduceMicro;
+  if (quoteDelta >= 0n) throw new Error('减仓方向会加仓或反手，拒绝');
+  const quote = await sdk.estimateTakerAdjust(perp, { perpDelta: quoteDelta });
+  let spotPrice;
+  if (req.maxImpactPct != null) {
+    const pd = await sdk.getPerpData(perp);
+    spotPrice = pd?.spotMark ?? pd?.mark;
+  }
+  const plan = planLongReduce({
+    entryPerpDelta: entry, reduceMicro, quote, slippagePct: req.slippagePct,
+    maxImpactPct: req.maxImpactPct, spotPrice,
+  });
+  if (plan.marginDelta !== 0n || plan.perpDelta !== quoteDelta) throw new Error('内部减仓参数错误，拒绝');
+  let txHash;
+  if (plan.full) {
+    // closePosition 再读一遍链上大小，marginDelta=0、perpDelta=-全部，平光后退回保证金。不调用 adjustMargin。
+    const r = await sdk.closePosition(perp, id, { amt1Limit: plan.amt1Limit });
+    txHash = r.txHash;
+  } else {
+    const r = await sdk.adjustTaker(perp, {
+      posId: id, marginDelta: 0n, perpDelta: plan.perpDelta, amt1Limit: plan.amt1Limit,
+    });
+    txHash = r.txHash;
+  }
+  return {
+    ok: true, action: 'reduce', mode: plan.full ? 'close' : 'adjust', closed: plan.full,
+    positionId: id.toString(), txHash, marginDelta: '0', perpDelta: plan.perpDelta.toString(),
+    reducedPerp: reduceMicro.toString(), expectedRemainingPerp: plan.expectedRemainingPerp.toString(),
+    amt1Limit: plan.amt1Limit.toString(), slippagePct: req.slippagePct,
+    impactChecked: req.maxImpactPct != null, impactPct: plan.impactPct,
+    quoteUsdMicro: quote.usdDelta.toString(), quoteEffectiveUsdMicro: quote.effectiveUsdDelta.toString(),
+    quoteFillPrice: quote.fillPrice ?? null, quoteEffectiveFillPrice: quote.effectiveFillPrice ?? null,
+    quoteProceedsAreWalletCash: false, walletUsdcCredit: plan.full ? 'collateral' : 'none',
+  };
+}
+
 const readStdin = async () => { let s = ''; for await (const ch of process.stdin) s += ch; return JSON.parse(s); };
 
 async function main() {
@@ -149,6 +303,7 @@ async function main() {
   if (!/^0x[0-9a-fA-F]{40}$/.test(req.perp || '')) throw new Error('perp 地址无效');
   if (process.argv.includes('--validate-only')) {
     if (req.action === 'open') checkOpenRequest(req);
+    if (req.action === 'reduce') checkReduceRequest(req);
     console.log(JSON.stringify({ ok: true, action: req.action })); return;
   }
   const perp = req.perp;
@@ -223,9 +378,24 @@ async function main() {
     const { txHash } = await closePosition(c, perp, id, { amt1Limit });
     console.log(JSON.stringify({ ok: true, txHash, fillPrice: quote.effectiveFillPrice ?? quote.fillPrice,
       proceeds: Number(quote.effectiveUsdDelta) / 1e6 }));
+  } else if (req.action === 'reduce') {
+    const out = await executeLongReduce(req, {
+      getPositionRawData: (p, id) => c.getPositionRawData(p, id),
+      estimateTakerAdjust: (p, params) => estimateTakerAdjust(c, p, params),
+      getPerpData: (p) => c.getPerpData(p),
+      adjustTaker: (p, params) => adjustTaker(c, p, params),
+      closePosition: (p, id, params) => closePosition(c, p, id, params),
+    });
+    console.log(j(out));
   } else {
     throw new Error('未知 action');
   }
 }
 
-main().catch((e) => { console.error(e?.message || String(e)); process.exit(1); });
+function invokedDirectly() {
+  const arg = process.argv[1];
+  if (!arg) return false;
+  return import.meta.url === pathToFileURL(path.resolve(arg)).href;
+}
+
+if (invokedDirectly()) main().catch((e) => { console.error(e?.message || String(e)); process.exit(1); });
