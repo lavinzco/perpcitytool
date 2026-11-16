@@ -1,0 +1,12 @@
+import { PerpCityContext, estimateTakerPosition } from '@strobelabs/perpcity-sdk';
+import { createWalletClient, http } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+import { arbitrum } from 'viem/chains';
+const perp='0xb9F540CE4315e7F4382C96532f8eC3903899D86d';
+const w=createWalletClient({account:privateKeyToAccount(process.env.PRIVATE_KEY),chain:arbitrum,transport:http(process.env.RPC_URL)});
+const c=new PerpCityContext({rpcUrl:process.env.RPC_URL,walletClient:w,deployments:{usdc:'0xaf88d065e77c8cC2239327C5EDb3A432268e5831'}});
+await c.validateChainId();
+const pd=await c.getPerpData(perp);
+const price=pd.spotMark??pd.mark;
+const q=await estimateTakerPosition(c,perp,{isLong:true,margin:30,leverage:1});
+console.log(JSON.stringify({price,quote:q},(k,v)=>typeof v==='bigint'?v.toString():v));
