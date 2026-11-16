@@ -26,7 +26,7 @@ import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import {
   PerpCityContext, estimateTakerPosition, calculateTakerSlippageLimit,
-  openTakerPosition, estimateTakerAdjust, closePosition, fetchPoolTickMap,
+  openTakerPosition, estimateTakerAdjust, adjustTaker, closePosition, fetchPoolTickMap,
 } from '@strobelabs/perpcity-sdk';
 import { PERP_ABI } from '@strobelabs/perpcity-sdk/abis';
 import { fundingPaymentUsd, takerUtilOwed } from '@strobelabs/perpcity-sdk/math';

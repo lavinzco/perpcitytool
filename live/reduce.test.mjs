@@ -1,6 +1,8 @@
 // 减仓单测：官方 calculateTakerSlippageLimit + mock 的链上 SDK。不连 RPC、不签名、不发交易。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { calculateTakerSlippageLimit } from '@strobelabs/perpcity-sdk';
 import { executeLongReduce, parseReduceMicro, planLongReduce } from './trade.mjs';
 
@@ -181,6 +183,84 @@ test('exact remaining size and full:true close, and do not withdraw margin', asy
     () => executeLongReduce(baseReq({ size: '1', full: true }), harness(entry).sdk),
     /不一致/,
   );
+});
+
+test('live reduce path calls the imported SDK adjustTaker and does not send', () => {
+  const probe = `
+import vm from 'node:vm';
+import { readFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+const file = process.env.TRADE_MJS;
+const raw = readFileSync(file, 'utf8');
+const block = raw.match(/executeLongReduce\\(req,\\s*\\{([\\s\\S]*?)\\}\\);/);
+if (!block) throw new Error('live reduce wiring missing');
+if (!/adjustTaker:\\s*\\(p,\\s*params\\)\\s*=>\\s*adjustTaker\\(c,\\s*p,\\s*params\\)/.test(block[1])) {
+  throw new Error('live wiring does not call imported adjustTaker');
+}
+const imp = raw.match(/import\\s*\\{([^}]+)\\}\\s*from\\s*'@strobelabs\\/perpcity-sdk'/);
+const imported = imp[1].split(',').map((s) => s.trim()).filter(Boolean);
+if (!imported.includes('adjustTaker')) throw new Error('SDK import missing adjustTaker');
+async function load(src) {
+  const mod = new vm.SourceTextModule(src + '\\nexport async function __probeLiveAdjustTaker(c, perp, params) {\\n  const wiring = {' + block[1] + '};\\n  return wiring.adjustTaker(perp, params);\\n}\\n', {
+    identifier: pathToFileURL(file).href,
+  });
+  await mod.link(async (specifier) => {
+    const ns = await import(specifier);
+    const names = Object.keys(ns);
+    return new vm.SyntheticModule(names, function () {
+      for (const k of names) this.setExport(k, ns[k]);
+    }, { identifier: specifier });
+  });
+  await mod.evaluate();
+  return mod.namespace.__probeLiveAdjustTaker;
+}
+const params = { posId: 187n, marginDelta: 0n, perpDelta: -1n, amt1Limit: 1n };
+async function once(src) {
+  const call = await load(src);
+  let simulated = null;
+  let wrote = false;
+  const c = {
+    publicClient: {
+      simulateContract(arg) { simulated = arg; throw new Error('STOP_BEFORE_SEND'); },
+    },
+    walletClient: { account: {}, writeContract() { wrote = true; throw new Error('WRITE'); } },
+  };
+  try {
+    await call(c, '0xb9F540CE4315e7F4382C96532f8eC3903899D86d', params);
+    return { resolved: true, wrote, simulated };
+  } catch (e) {
+    return {
+      name: e?.name, message: String(e?.message || e), wrote,
+      functionName: simulated?.functionName || null,
+      marginDelta: simulated?.args?.[0]?.marginDelta?.toString?.() ?? null,
+      perpDelta: simulated?.args?.[0]?.perpDelta?.toString?.() ?? null,
+    };
+  }
+}
+const hit = await once(raw);
+const stripped = raw.replace(/import\\s*\\{([^}]+)\\}\\s*from\\s*'@strobelabs\\/perpcity-sdk'/, (full, inner) => {
+  const names = inner.split(',').map((s) => s.trim()).filter((n) => n && n !== 'adjustTaker');
+  return "import {\\n  " + names.join(', ') + "\\n} from '@strobelabs/perpcity-sdk'";
+});
+const miss = await once(stripped);
+console.log(JSON.stringify({ hit, miss }));
+`;
+  const r = spawnSync(process.execPath, ['--experimental-vm-modules', '--input-type=module'], {
+    input: probe, encoding: 'utf8', cwd: new URL('.', import.meta.url),
+    env: { ...process.env, TRADE_MJS: new URL('./trade.mjs', import.meta.url).pathname },
+  });
+  assert.equal(r.status, 0, r.stderr || r.stdout);
+  const line = r.stdout.trim().split('\n').filter((s) => s.startsWith('{')).pop();
+  const { hit, miss } = JSON.parse(line);
+  assert.equal(hit.functionName, 'adjustTaker');
+  assert.equal(hit.marginDelta, '0');
+  assert.equal(hit.perpDelta, '-1');
+  assert.equal(hit.wrote, false);
+  assert.match(hit.message, /STOP_BEFORE_SEND/);
+  assert.notEqual(hit.name, 'ReferenceError');
+  assert.equal(miss.functionName, null);
+  assert.equal(miss.name, 'ReferenceError');
+  assert.match(miss.message, /adjustTaker/);
 });
 
 test('each call reads the fresh remaining size', async () => {
