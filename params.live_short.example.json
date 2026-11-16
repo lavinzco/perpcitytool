@@ -1,0 +1,29 @@
+{
+  "long_open_hour": 7,
+  "long_close_hour": 16,
+  "target_notional_usd": 200,
+  "batch_notional_usd": 50,
+  "batch_interval_min": 10,
+  "leverage": 2,
+  "max_notional_usd": 300,
+  "max_impact_pct": 1.5,
+  "max_slippage_pct": 1.5,
+  "stop_loss_margin_pct": 30,
+  "stop_max_impact_pct": 4,
+  "stop_slippage_pct": 3,
+  "close_force_after_hours": 1,
+  "max_chase_pct": 5,
+  "max_adverse_funding_pct_day": 6,
+  "entry_grace_hours": 2,
+  "usdc_buffer_usd": 0.5,
+  "ignore_position_ids": [
+    117
+  ],
+  "short_enabled": true,
+  "short_open_hour": 19,
+  "short_close_hour": 5,
+  "short_target_notional_usd": 200,
+  "short_entry_grace_hours": 1,
+  "short_close_force_after_hours": 1,
+  "daily_total_open_cap_usd": 0
+}

@@ -1,0 +1,31 @@
+# live secrets and runtime (do not commit)
+params.live.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+*.p12
+*.pfx
+credentials*
+*secret*
+*mnemonic*
+auth.json
+.npmrc
+.netrc
+
+# runtime / outputs
+logs/
+state/
+_bak/
+node_modules/
+__pycache__/
+*.pyc
+*.pid
+*.lock
+live.out
+*.log
+
+# local machine paths / pid
+run_live.pid
