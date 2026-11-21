@@ -18,6 +18,7 @@ auth.json
 # runtime / outputs
 logs/
 state/
+oneoff/runtime/
 _bak/
 node_modules/
 __pycache__/
